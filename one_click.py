@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 script_dir = os.getcwd()
-conda_env_path = os.path.join(script_dir, "installer_files", "env")
+python_venv_path = os.path.join(script_dir, "installer_files", "venv")
 
 # Remove the '# ' from the following lines as needed for your AMD GPU on Linux
 # os.environ["ROCM_PATH"] = '/opt/rocm'
@@ -80,7 +80,7 @@ def cpu_has_amx():
 def torch_version():
     site_packages_path = None
     for sitedir in site.getsitepackages():
-        if "site-packages" in sitedir and conda_env_path in sitedir:
+        if "site-packages" in sitedir and python_venv_path in sitedir:
             site_packages_path = sitedir
             break
 
@@ -96,31 +96,31 @@ def torch_version():
 def is_installed():
     site_packages_path = None
     for sitedir in site.getsitepackages():
-        if "site-packages" in sitedir and conda_env_path in sitedir:
+        if "site-packages" in sitedir and python_venv_path in sitedir:
             site_packages_path = sitedir
             break
 
     if site_packages_path:
         return os.path.isfile(os.path.join(site_packages_path, 'torch', '__init__.py'))
     else:
-        return os.path.isdir(conda_env_path)
+        return os.path.isdir(python_venv_path)
 
 
 def check_env():
-    # If we have access to conda, we are probably in an environment
-    conda_exist = run_cmd("conda", environment=True, capture_output=True).returncode == 0
-    if not conda_exist:
-        print("Conda is not installed. Exiting...")
+    # If we have access to pip, we are probably in an environment
+    pip_exist = run_cmd("pip", environment=True, capture_output=True).returncode == 0
+    if not pip_exist:
+        print("Pip is not installed. Exiting...")
         sys.exit(1)
 
     # Ensure this is a new environment and not the base environment
-    if os.environ["CONDA_DEFAULT_ENV"] == "base":
+    if os.environ["VIRTUAL_ENV"] == None:
         print("Create an environment for this project and activate it. Exiting...")
         sys.exit(1)
 
 
 def clear_cache():
-    run_cmd("conda clean -a -y", environment=True)
+    #run_cmd("conda clean -a -y", environment=True)
     run_cmd("python -m pip cache purge", environment=True)
 
 
@@ -147,12 +147,7 @@ def calculate_file_hash(file_path):
 def run_cmd(cmd, assert_success=False, environment=False, capture_output=False, env=None):
     # Use the conda environment
     if environment:
-        if is_windows():
-            conda_bat_path = os.path.join(script_dir, "installer_files", "conda", "condabin", "conda.bat")
-            cmd = "\"" + conda_bat_path + "\" activate \"" + conda_env_path + "\" >nul && " + cmd
-        else:
-            conda_sh_path = os.path.join(script_dir, "installer_files", "conda", "etc", "profile.d", "conda.sh")
-            cmd = ". \"" + conda_sh_path + "\" && conda activate \"" + conda_env_path + "\" && " + cmd
+	    cmd = f'source "{python_venv_path}/bin/activate" && {cmd}'
 
     # Run shell commands
     result = subprocess.run(cmd, shell=True, capture_output=capture_output, env=env)
@@ -203,7 +198,6 @@ def install_webui():
                 cmd_flags_file.write("\n--cpu")
 
     # Find the proper Pytorch installation command
-    install_git = "conda install -y -k ninja git"
     install_pytorch = "python -m pip install torch==2.1.* torchvision==0.16.* torchaudio==2.1.* "
 
     use_cuda118 = "N"
@@ -237,12 +231,12 @@ def install_webui():
 
     # Install Git and then Pytorch
     print_big_message("Installing PyTorch.")
-    run_cmd(f"{install_git} && {install_pytorch} && python -m pip install py-cpuinfo==9.0.0", assert_success=True, environment=True)
+    run_cmd(f"{install_pytorch} && python -m pip install py-cpuinfo==9.0.0", assert_success=True, environment=True)
 
     # Install CUDA libraries (this wasn't necessary for Pytorch before...)
-    if selected_gpu == "NVIDIA":
-        print_big_message("Installing the CUDA runtime libraries.")
-        run_cmd(f"conda install -y -c \"nvidia/label/{'cuda-12.1.1' if use_cuda118 == 'N' else 'cuda-11.8.0'}\" cuda-runtime", assert_success=True, environment=True)
+    #if selected_gpu == "NVIDIA":
+    #    print_big_message("Installing the CUDA runtime libraries.")
+    #    run_cmd(f"conda install -y -c \"nvidia/label/{'cuda-12.1.1' if use_cuda118 == 'N' else 'cuda-11.8.0'}\" cuda-runtime", assert_success=True, environment=True)
 
     # Install the webui requirements
     update_requirements(initial_installation=True)
@@ -341,7 +335,7 @@ def update_requirements(initial_installation=False):
     os.remove('temp_requirements.txt')
 
     # Check for '+cu' or '+rocm' in version string to determine if torch uses CUDA or ROCm. Check for pytorch-cuda as well for backwards compatibility
-    if not any((is_cuda, is_rocm)) and run_cmd("conda list -f pytorch-cuda | grep pytorch-cuda", environment=True, capture_output=True).returncode == 1:
+    if not any((is_cuda, is_rocm)) and run_cmd("pip list -f pytorch-cuda | grep pytorch-cuda", environment=True, capture_output=True).returncode == 1:
         clear_cache()
         return
 
@@ -356,7 +350,7 @@ def launch_webui():
 
 
 if __name__ == "__main__":
-    # Verifies we are in a conda environment
+    # Verifies we are in a virtual environment
     check_env()
 
     parser = argparse.ArgumentParser(add_help=False)
@@ -387,9 +381,9 @@ if __name__ == "__main__":
             print_big_message("WARNING: You haven't downloaded any model yet.\nOnce the web UI launches, head over to the \"Model\" tab and download one.")
 
         # Workaround for llama-cpp-python loading paths in CUDA env vars even if they do not exist
-        conda_path_bin = os.path.join(conda_env_path, "bin")
-        if not os.path.exists(conda_path_bin):
-            os.mkdir(conda_path_bin)
+        venv_path_bin = os.path.join(python_venv_path, "bin")
+        if not os.path.exists(venv_path_bin):
+            os.mkdir(venv_path_bin)
 
         # Launch the webui
         launch_webui()
