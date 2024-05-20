@@ -54,7 +54,7 @@ else
     # linking llama-2 model from source
     if [[ $LINK_THIS_MODEL ]]
     then
-        ln -s $SCRIPT_DIR/models/$LINK_THIS_MODEL models/$LINK_THIS_MODEL
+        ln -s $T_ROOT/$LINK_THIS_MODEL models/$LINK_THIS_MODEL
     fi
 fi
 
