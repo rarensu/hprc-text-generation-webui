@@ -50,6 +50,7 @@ else
     printf "\n%s\n" "${delimiter}"
     "${GIT}" clone $SCRIPT_DIR "${clone_dir}"
     cd "${clone_dir}"/ || { printf "\e[1m\e[31mERROR: Can't cd to %s/%s/, aborting...\e[0m" "${install_dir}" "${clone_dir}"; exit 1; }
+    git checkout HPRC
     git remote set-url origin https://github.com/oobabooga/text-generation-webui.git
     # linking llama-2 model from source
     if [[ $LINK_THIS_MODEL ]]
