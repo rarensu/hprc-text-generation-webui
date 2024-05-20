@@ -84,7 +84,8 @@ def torch_version():
             site_packages_path = sitedir
             break
 
-    if site_packages_path:
+    #if site_packages_path:
+    if False:
         torch_version_file = open(os.path.join(site_packages_path, 'torch', 'version.py')).read().splitlines()
         torver = [line for line in torch_version_file if '__version__' in line][0].split('__version__ = ')[1].strip("'")
     else:
@@ -108,7 +109,7 @@ def is_installed():
 
 def check_env():
     # If we have access to pip, we are probably in an environment
-    pip_exist = run_cmd("pip", environment=True, capture_output=True).returncode == 0
+    pip_exist = run_cmd("pip --version", environment=True).returncode == 0
     if not pip_exist:
         print("Pip is not installed. Exiting...")
         sys.exit(1)
@@ -150,7 +151,7 @@ def run_cmd(cmd, assert_success=False, environment=False, capture_output=False, 
 	    cmd = f'source "{python_venv_path}/bin/activate" && {cmd}'
 
     # Run shell commands
-    result = subprocess.run(cmd, shell=True, capture_output=capture_output, env=env)
+    result = subprocess.run(cmd, shell=True, capture_output=capture_output, env=env, executable="/bin/bash")
 
     # Assert the command ran successfully
     if assert_success and result.returncode != 0:
@@ -231,7 +232,7 @@ def install_webui():
 
     # Install Git and then Pytorch
     print_big_message("Installing PyTorch.")
-    run_cmd(f"{install_pytorch} && python -m pip install py-cpuinfo==9.0.0", assert_success=True, environment=True)
+    run_cmd(f"echo '(skipped)' {install_pytorch} && python -m pip install py-cpuinfo==9.0.0", assert_success=True, environment=True)
 
     # Install CUDA libraries (this wasn't necessary for Pytorch before...)
     #if selected_gpu == "NVIDIA":
@@ -239,7 +240,8 @@ def install_webui():
     #    run_cmd(f"conda install -y -c \"nvidia/label/{'cuda-12.1.1' if use_cuda118 == 'N' else 'cuda-11.8.0'}\" cuda-runtime", assert_success=True, environment=True)
 
     # Install the webui requirements
-    update_requirements(initial_installation=True)
+    print("skipped installing extension requirements") 
+    #update_requirements(initial_installation=True)
 
 
 def update_requirements(initial_installation=False):

@@ -35,6 +35,7 @@ unset PYTHONPATH
 unset PYTHONHOME
 #export CUDA_PATH="$INSTALL_ENV_DIR"
 #export CUDA_HOME="$CUDA_PATH"
+export HF_TOKEN=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
 
 # activate installer env
 source  $VENV_DIR/bin/activate 
