@@ -55,7 +55,7 @@ else
     # linking llama-2 model from source
     if [[ -n "$LINK_THIS_MODEL" ]]
     then
-        local model_path=$(readlink -e $T_ROOT/$LINK_THIS_MODEL)
+        local model_path=$(readlink -e /sw/hprc/sw/text-generation/models/$LINK_THIS_MODEL)
         ln -s $model_path models/$LINK_THIS_MODEL
     fi
 fi
