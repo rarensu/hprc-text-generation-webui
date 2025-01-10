@@ -25,13 +25,13 @@ def save_file(fname, contents):
     rel_path_str = os.path.relpath(abs_path_str, root_folder)
     rel_path = Path(rel_path_str)
     if rel_path.parts[0] == '..':
-        logger.error(f'Invalid file path: {fname}')
+        logger.error(f'Invalid file path: \"{fname}\"')
         return
 
     with open(abs_path_str, 'w', encoding='utf-8') as f:
         f.write(contents)
 
-    logger.info(f'Saved {abs_path_str}.')
+    logger.info(f'Saved \"{abs_path_str}\".')
 
 
 def delete_file(fname):
@@ -44,12 +44,12 @@ def delete_file(fname):
     rel_path_str = os.path.relpath(abs_path_str, root_folder)
     rel_path = Path(rel_path_str)
     if rel_path.parts[0] == '..':
-        logger.error(f'Invalid file path: {fname}')
+        logger.error(f'Invalid file path: \"{fname}\"')
         return
 
     if rel_path.exists():
         rel_path.unlink()
-        logger.info(f'Deleted {fname}.')
+        logger.info(f'Deleted \"{fname}\".')
 
 
 def current_time():
@@ -76,7 +76,16 @@ def get_available_models():
     model_list = []
     for item in list(Path(f'{shared.args.model_dir}/').glob('*')):
         if not item.name.endswith(('.txt', '-np', '.pt', '.json', '.yaml', '.py')) and 'llama-tokenizer' not in item.name:
-            model_list.append(re.sub('.pth$', '', item.name))
+            model_list.append(item.name)
+
+    return ['None'] + sorted(model_list, key=natural_keys)
+
+
+def get_available_ggufs():
+    model_list = []
+    for item in Path(f'{shared.args.model_dir}/').glob('*'):
+        if item.is_file() and item.name.lower().endswith(".gguf"):
+            model_list.append(item.name)
 
     return ['None'] + sorted(model_list, key=natural_keys)
 
@@ -86,11 +95,10 @@ def get_available_presets():
 
 
 def get_available_prompts():
-    prompts = []
-    files = set((k.stem for k in Path('prompts').glob('*.txt')))
-    prompts += sorted([k for k in files if re.match('^[0-9]', k)], key=natural_keys, reverse=True)
-    prompts += sorted([k for k in files if re.match('^[^0-9]', k)], key=natural_keys)
-    prompts += ['None']
+    prompt_files = list(Path('prompts').glob('*.txt'))
+    sorted_files = sorted(prompt_files, key=lambda x: x.stat().st_mtime, reverse=True)
+    prompts = [file.stem for file in sorted_files]
+    prompts.append('None')
     return prompts
 
 
@@ -105,7 +113,7 @@ def get_available_instruction_templates():
     if os.path.exists(path):
         paths = (x for x in Path(path).iterdir() if x.suffix in ('.json', '.yaml', '.yml'))
 
-    return ['Select template to load...'] + sorted(set((k.stem for k in paths)), key=natural_keys)
+    return ['None'] + sorted(set((k.stem for k in paths)), key=natural_keys)
 
 
 def get_available_extensions():

@@ -7,12 +7,6 @@ The main API for this project is meant to be a drop-in replacement to the OpenAI
 * It doesn't connect to OpenAI.
 * It doesn't use the openai-python library.
 
-If you did not use the one-click installers, you may need to install the requirements first:
-
-```
-pip install -r extensions/openai/requirements.txt
-```
-
 ### Starting the API
 
 Add `--api` to your command-line flags.
@@ -25,7 +19,7 @@ Add `--api` to your command-line flags.
 
 ### Examples
 
-For the documentation with all the parameters and their types, consult `http://127.0.0.1:5000/docs` or the [typing.py](https://github.com/oobabooga/text-generation-webui/blob/main/extensions/openai/typing.py) file.
+For the documentation with all the endpoints, parameters and their types, consult `http://127.0.0.1:5000/docs` or the [typing.py](https://github.com/oobabooga/text-generation-webui/blob/main/extensions/openai/typing.py) file.
 
 The official examples in the [OpenAI documentation](https://platform.openai.com/docs/api-reference) should also work, and the same parameters apply (although the API here has more optional parameters).
 
@@ -99,7 +93,7 @@ curl http://127.0.0.1:5000/v1/chat/completions \
 
 #### Logits
 
-```
+```shell
 curl -k http://127.0.0.1:5000/v1/internal/logits \
   -H "Content-Type: application/json" \
   -d '{
@@ -110,13 +104,37 @@ curl -k http://127.0.0.1:5000/v1/internal/logits \
 
 #### Logits after sampling parameters
 
-```
+```shell
 curl -k http://127.0.0.1:5000/v1/internal/logits \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "Who is best, Asuka or Rei? Answer:",
     "use_samplers": true,
     "top_k": 3
+  }'
+```
+
+#### List models
+
+```shell
+curl -k http://127.0.0.1:5000/v1/internal/model/list \
+  -H "Content-Type: application/json"
+```
+
+#### Load model
+
+```shell
+curl -k http://127.0.0.1:5000/v1/internal/model/load \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_name": "model_name",
+    "args": {
+      "load_in_4bit": true,
+      "n_gpu_layers": 12
+    },
+    "settings": {
+      "instruction_template": "Alpaca"
+    }
   }'
 ```
 
@@ -225,7 +243,7 @@ print()
 
 ### Environment variables
 
-The following environment variables can be used (they take precendence over everything else):
+The following environment variables can be used (they take precedence over everything else):
 
 | Variable Name          | Description                                                                                        | Example Value              |
 |------------------------|------------------------------------|----------------------------|

@@ -3,6 +3,7 @@ import copy
 import functools
 import html
 import json
+import pprint
 import re
 from datetime import datetime
 from functools import partial
@@ -14,8 +15,13 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 from PIL import Image
 
 import modules.shared as shared
+from modules import utils
 from modules.extensions import apply_extensions
-from modules.html_generator import chat_html_wrapper, make_thumbnail
+from modules.html_generator import (
+    chat_html_wrapper,
+    convert_to_markdown,
+    make_thumbnail
+)
 from modules.logging_colors import logger
 from modules.text_generation import (
     generate_reply,
@@ -81,10 +87,28 @@ def generate_chat_prompt(user_input, state, **kwargs):
     history = kwargs.get('history', state['history'])['internal']
 
     # Templates
-    chat_template = jinja_env.from_string(state['chat_template_str'])
+    chat_template_str = state['chat_template_str']
+    if state['mode'] != 'instruct':
+        chat_template_str = replace_character_names(chat_template_str, state['name1'], state['name2'])
+
     instruction_template = jinja_env.from_string(state['instruction_template_str'])
-    chat_renderer = partial(chat_template.render, add_generation_prompt=False, name1=state['name1'], name2=state['name2'])
-    instruct_renderer = partial(instruction_template.render, add_generation_prompt=False)
+    chat_template = jinja_env.from_string(chat_template_str)
+
+    instruct_renderer = partial(
+        instruction_template.render,
+        builtin_tools=None,
+        tools=None,
+        tools_in_user_message=False,
+        add_generation_prompt=False
+    )
+
+    chat_renderer = partial(
+        chat_template.render,
+        add_generation_prompt=False,
+        name1=state['name1'],
+        name2=state['name2'],
+        user_bio=replace_character_names(state['user_bio'], state['name1'], state['name2']),
+    )
 
     messages = []
 
@@ -94,7 +118,7 @@ def generate_chat_prompt(user_input, state, **kwargs):
             messages.append({"role": "system", "content": state['custom_system_message']})
     else:
         renderer = chat_renderer
-        if state['context'].strip() != '':
+        if state['context'].strip() != '' or state['user_bio'].strip() != '':
             context = replace_character_names(state['context'], state['name1'], state['name2'])
             messages.append({"role": "system", "content": context})
 
@@ -114,7 +138,7 @@ def generate_chat_prompt(user_input, state, **kwargs):
         messages.append({"role": "user", "content": user_input})
 
     def remove_extra_bos(prompt):
-        for bos_token in ['<s>', '<|startoftext|>']:
+        for bos_token in ['<s>', '<|startoftext|>', '<BOS_TOKEN>', '<|endoftext|>']:
             while prompt.startswith(bos_token):
                 prompt = prompt[len(bos_token):]
 
@@ -135,6 +159,7 @@ def generate_chat_prompt(user_input, state, **kwargs):
             command = state['chat-instruct_command']
             command = command.replace('<|character|>', state['name2'] if not impersonate else state['name1'])
             command = command.replace('<|prompt|>', prompt)
+            command = replace_character_names(command, state['name1'], state['name2'])
 
             if _continue:
                 prefix = get_generation_prompt(renderer, impersonate=impersonate, strip_trailing_spaces=False)[0]
@@ -149,12 +174,14 @@ def generate_chat_prompt(user_input, state, **kwargs):
 
             prompt = instruction_template.render(messages=outer_messages)
             suffix = get_generation_prompt(instruct_renderer, impersonate=False)[1]
-            prompt = prompt[:-len(suffix)]
+            if len(suffix) > 0:
+                prompt = prompt[:-len(suffix)]
 
         else:
             if _continue:
                 suffix = get_generation_prompt(renderer, impersonate=impersonate)[1]
-                prompt = prompt[:-len(suffix)]
+                if len(suffix) > 0:
+                    prompt = prompt[:-len(suffix)]
             else:
                 prefix = get_generation_prompt(renderer, impersonate=impersonate)[0]
                 if state['mode'] == 'chat' and not impersonate:
@@ -168,15 +195,51 @@ def generate_chat_prompt(user_input, state, **kwargs):
     prompt = make_prompt(messages)
 
     # Handle truncation
-    max_length = get_max_prompt_length(state)
-    while len(messages) > 0 and get_encoded_length(prompt) > max_length:
-        # Try to save the system message
-        if len(messages) > 1 and messages[0]['role'] == 'system':
-            messages.pop(1)
-        else:
-            messages.pop(0)
+    if shared.tokenizer is not None:
+        max_length = get_max_prompt_length(state)
+        encoded_length = get_encoded_length(prompt)
+        while len(messages) > 0 and encoded_length > max_length:
 
-        prompt = make_prompt(messages)
+            # Remove old message, save system message
+            if len(messages) > 2 and messages[0]['role'] == 'system':
+                messages.pop(1)
+
+            # Remove old message when no system message is present
+            elif len(messages) > 1 and messages[0]['role'] != 'system':
+                messages.pop(0)
+
+            # Resort to truncating the user input
+            else:
+
+                user_message = messages[-1]['content']
+
+                # Bisect the truncation point
+                left, right = 0, len(user_message) - 1
+
+                while right - left > 1:
+                    mid = (left + right) // 2
+
+                    messages[-1]['content'] = user_message[:mid]
+                    prompt = make_prompt(messages)
+                    encoded_length = get_encoded_length(prompt)
+
+                    if encoded_length <= max_length:
+                        left = mid
+                    else:
+                        right = mid
+
+                messages[-1]['content'] = user_message[:left]
+                prompt = make_prompt(messages)
+                encoded_length = get_encoded_length(prompt)
+                if encoded_length > max_length:
+                    logger.error(f"Failed to build the chat prompt. The input is too long for the available context length.\n\nTruncation length: {state['truncation_length']}\nmax_new_tokens: {state['max_new_tokens']} (is it too high?)\nAvailable context length: {max_length}\n")
+                    raise ValueError
+                else:
+                    logger.warning(f"The input has been truncated. Context length: {state['truncation_length']}, max_new_tokens: {state['max_new_tokens']}, available context length: {max_length}.")
+                    break
+
+            prompt = make_prompt(messages)
+            encoded_length = get_encoded_length(prompt)
 
     if also_return_rows:
         return prompt, [message['content'] for message in messages]
@@ -209,10 +272,27 @@ def get_stopping_strings(state):
             suffix_bot + prefix_user,
         ]
 
+    # Try to find the EOT token
+    for item in stopping_strings.copy():
+        item = item.strip()
+        if item.startswith("<") and ">" in item:
+            stopping_strings.append(item.split(">")[0] + ">")
+        elif item.startswith("[") and "]" in item:
+            stopping_strings.append(item.split("]")[0] + "]")
+
     if 'stopping_strings' in state and isinstance(state['stopping_strings'], list):
         stopping_strings += state.pop('stopping_strings')
 
-    return list(set(stopping_strings))
+    # Remove redundant items that start with another item
+    result = [item for item in stopping_strings if not any(item.startswith(other) and item != other for other in stopping_strings)]
+    result = list(set(result))
+
+    if shared.args.verbose:
+        logger.info("STOPPING_STRINGS=")
+        pprint.PrettyPrinter(indent=4, sort_dicts=False).pprint(result)
+        print()
+
+    return result
 
 
 def chatbot_wrapper(text, state, regenerate=False, _continue=False, loading_message=True, for_ui=False):
@@ -258,9 +338,6 @@ def chatbot_wrapper(text, state, regenerate=False, _continue=False, loading_mess
                     'internal': output['internal']
                 }
 
-    if shared.model_name == 'None' or shared.model is None:
-        raise ValueError("No model is loaded! Select one in the Model tab.")
-
     # Generate the prompt
     kwargs = {
         '_continue': _continue,
@@ -275,13 +352,17 @@ def chatbot_wrapper(text, state, regenerate=False, _continue=False, loading_mess
     for j, reply in enumerate(generate_reply(prompt, state, stopping_strings=stopping_strings, is_chat=True, for_ui=for_ui)):
 
         # Extract the reply
-        visible_reply = reply
         if state['mode'] in ['chat', 'chat-instruct']:
-            visible_reply = re.sub("(<USER>|<user>|{{user}})", state['name1'], reply)
+            visible_reply = re.sub("(<USER>|<user>|{{user}})", state['name1'], reply + '▍')
+        else:
+            visible_reply = reply + '▍'
 
         visible_reply = html.escape(visible_reply)
 
         if shared.stop_everything:
+            if output['visible'][-1][1].endswith('▍'):
+                output['visible'][-1][1] = output['visible'][-1][1][:-1]
+
             output['visible'][-1][1] = apply_extensions('output', output['visible'][-1][1], state, is_chat=True)
             yield output
             return
@@ -297,18 +378,15 @@ def chatbot_wrapper(text, state, regenerate=False, _continue=False, loading_mess
             if is_stream:
                 yield output
 
+    if output['visible'][-1][1].endswith('▍'):
+        output['visible'][-1][1] = output['visible'][-1][1][:-1]
+
     output['visible'][-1][1] = apply_extensions('output', output['visible'][-1][1], state, is_chat=True)
     yield output
 
 
 def impersonate_wrapper(text, state):
-
     static_output = chat_html_wrapper(state['history'], state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'])
-
-    if shared.model_name == 'None' or shared.model is None:
-        logger.error("No model is loaded! Select one in the Model tab.")
-        yield '', static_output
-        return
 
     prompt = generate_chat_prompt('', state, impersonate=True)
     stopping_strings = get_stopping_strings(state)
@@ -361,8 +439,11 @@ def generate_chat_reply_wrapper(text, state, regenerate=False, _continue=False):
         send_dummy_message(text, state)
         send_dummy_reply(state['start_with'], state)
 
+    history = state['history']
     for i, history in enumerate(generate_chat_reply(text, state, regenerate, _continue, loading_message=True, for_ui=True)):
         yield chat_html_wrapper(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu']), history
+
+    save_history(history, state['unique_id'], state['character_menu'], state['mode'])
 
 
 def remove_last_message(history):
@@ -424,7 +505,7 @@ def start_new_chat(state):
         greeting = replace_character_names(state['greeting'], state['name1'], state['name2'])
         if greeting != '':
             history['internal'] += [['<|BEGIN-VISIBLE-CHAT|>', greeting]]
-            history['visible'] += [['', apply_extensions('output', greeting, state, is_chat=True)]]
+            history['visible'] += [['', apply_extensions('output', html.escape(greeting), state, is_chat=True)]]
 
     unique_id = datetime.now().strftime('%Y%m%d-%H-%M-%S')
     save_history(history, unique_id, state['character_menu'], state['mode'])
@@ -450,7 +531,7 @@ def save_history(history, unique_id, character, mode):
         p.parent.mkdir(parents=True)
 
     with open(p, 'w', encoding='utf-8') as f:
-        f.write(json.dumps(history, indent=4))
+        f.write(json.dumps(history, indent=4, ensure_ascii=False))
 
 
 def rename_history(old_id, new_id, character, mode):
@@ -460,20 +541,19 @@ def rename_history(old_id, new_id, character, mode):
     old_p = get_history_file_path(old_id, character, mode)
     new_p = get_history_file_path(new_id, character, mode)
     if new_p.parent != old_p.parent:
-        logger.error(f"The following path is not allowed: {new_p}.")
+        logger.error(f"The following path is not allowed: \"{new_p}\".")
     elif new_p == old_p:
         logger.info("The provided path is identical to the old one.")
+    elif new_p.exists():
+        logger.error(f"The new path already exists and will not be overwritten: \"{new_p}\".")
     else:
-        logger.info(f"Renaming {old_p} to {new_p}")
+        logger.info(f"Renaming \"{old_p}\" to \"{new_p}\"")
         old_p.rename(new_p)
 
 
-def find_all_histories(state):
-    if shared.args.multi_user:
-        return ['']
-
+def get_paths(state):
     if state['mode'] == 'instruct':
-        paths = Path('logs/instruct').glob('*.json')
+        return Path('logs/instruct').glob('*.json')
     else:
         character = state['character_menu']
 
@@ -481,21 +561,70 @@ def find_all_histories(state):
         old_p = Path(f'logs/{character}_persistent.json')
         new_p = Path(f'logs/persistent_{character}.json')
         if old_p.exists():
-            logger.warning(f"Renaming {old_p} to {new_p}")
+            logger.warning(f"Renaming \"{old_p}\" to \"{new_p}\"")
             old_p.rename(new_p)
+
         if new_p.exists():
             unique_id = datetime.now().strftime('%Y%m%d-%H-%M-%S')
             p = get_history_file_path(unique_id, character, state['mode'])
-            logger.warning(f"Moving {new_p} to {p}")
+            logger.warning(f"Moving \"{new_p}\" to \"{p}\"")
             p.parent.mkdir(exist_ok=True)
             new_p.rename(p)
 
-        paths = Path(f'logs/chat/{character}').glob('*.json')
+        return Path(f'logs/chat/{character}').glob('*.json')
 
+
+def find_all_histories(state):
+    if shared.args.multi_user:
+        return ['']
+
+    paths = get_paths(state)
     histories = sorted(paths, key=lambda x: x.stat().st_mtime, reverse=True)
-    histories = [path.stem for path in histories]
+    return [path.stem for path in histories]
 
-    return histories
+
+def find_all_histories_with_first_prompts(state):
+    if shared.args.multi_user:
+        return []
+
+    paths = get_paths(state)
+    histories = sorted(paths, key=lambda x: x.stat().st_mtime, reverse=True)
+
+    result = []
+    for i, path in enumerate(histories):
+        filename = path.stem
+        file_content = ""
+        with open(path, 'r', encoding='utf-8') as f:
+            file_content = f.read()
+
+        if state['search_chat'] and state['search_chat'] not in file_content:
+            continue
+
+        data = json.loads(file_content)
+        if re.match(r'^[0-9]{8}-[0-9]{2}-[0-9]{2}-[0-9]{2}$', filename):
+            first_prompt = ""
+            if data and 'visible' in data and len(data['visible']) > 0:
+                if data['internal'][0][0] == '<|BEGIN-VISIBLE-CHAT|>':
+                    if len(data['visible']) > 1:
+                        first_prompt = html.unescape(data['visible'][1][0])
+                    elif i == 0:
+                        first_prompt = "New chat"
+                else:
+                    first_prompt = html.unescape(data['visible'][0][0])
+            elif i == 0:
+                first_prompt = "New chat"
+        else:
+            first_prompt = filename
+
+        first_prompt = first_prompt.strip()
+
+        # Truncate the first prompt if it's longer than 30 characters
+        if len(first_prompt) > 30:
+            first_prompt = first_prompt[:30 - 3] + '...'
+
+        result.append((first_prompt, filename))
+
+    return result
 
 
 def load_latest_history(state):
@@ -515,6 +644,35 @@ def load_latest_history(state):
         history = start_new_chat(state)
 
     return history
+
+
+def load_history_after_deletion(state, idx):
+    '''
+    Loads the latest history for the given character in chat or chat-instruct
+    mode, or the latest instruct history for instruct mode.
+    '''
+
+    if shared.args.multi_user:
+        return start_new_chat(state)
+
+    histories = find_all_histories_with_first_prompts(state)
+    idx = min(int(idx), len(histories) - 1)
+    idx = max(0, idx)
+
+    if len(histories) > 0:
+        history = load_history(histories[idx][1], state['character_menu'], state['mode'])
+    else:
+        history = start_new_chat(state)
+        histories = find_all_histories_with_first_prompts(state)
+
+    return history, gr.update(choices=histories, value=histories[idx][1])
+
+
+def update_character_menu_after_deletion(idx):
+    characters = utils.get_available_characters()
+    idx = min(int(idx), len(characters) - 1)
+    idx = max(0, idx)
+    return gr.update(choices=characters, value=characters[idx])
 
 
 def load_history(unique_id, character, mode):
@@ -625,6 +783,9 @@ def load_character(character, name1, name2):
 
 
 def load_instruction_template(template):
+    if template == 'None':
+        return ''
+
     for filepath in [Path(f'instruction-templates/{template}.yaml'), Path('instruction-templates/Alpaca.yaml')]:
         if filepath.exists():
             break
@@ -860,3 +1021,244 @@ def my_yaml_output(data):
             result += "  " + line.rstrip(' ') + "\n"
 
     return result
+
+
+def handle_replace_last_reply_click(text, state):
+    history = replace_last_reply(text, state)
+    save_history(history, state['unique_id'], state['character_menu'], state['mode'])
+    html = redraw_html(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'])
+
+    return [history, html, ""]
+
+
+def handle_send_dummy_message_click(text, state):
+    history = send_dummy_message(text, state)
+    save_history(history, state['unique_id'], state['character_menu'], state['mode'])
+    html = redraw_html(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'])
+
+    return [history, html, ""]
+
+
+def handle_send_dummy_reply_click(text, state):
+    history = send_dummy_reply(text, state)
+    save_history(history, state['unique_id'], state['character_menu'], state['mode'])
+    html = redraw_html(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'])
+
+    return [history, html, ""]
+
+
+def handle_remove_last_click(state):
+    last_input, history = remove_last_message(state['history'])
+    save_history(history, state['unique_id'], state['character_menu'], state['mode'])
+    html = redraw_html(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'])
+
+    return [history, html, last_input]
+
+
+def handle_unique_id_select(state):
+    history = load_history(state['unique_id'], state['character_menu'], state['mode'])
+    html = redraw_html(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'])
+
+    convert_to_markdown.cache_clear()
+
+    return [history, html]
+
+
+def handle_start_new_chat_click(state):
+    history = start_new_chat(state)
+    histories = find_all_histories_with_first_prompts(state)
+    html = redraw_html(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'])
+
+    convert_to_markdown.cache_clear()
+
+    if len(histories) > 0:
+        past_chats_update = gr.update(choices=histories, value=histories[0][1])
+    else:
+        past_chats_update = gr.update(choices=histories)
+
+    return [history, html, past_chats_update]
+
+
+def handle_delete_chat_confirm_click(state):
+    index = str(find_all_histories(state).index(state['unique_id']))
+    delete_history(state['unique_id'], state['character_menu'], state['mode'])
+    history, unique_id = load_history_after_deletion(state, index)
+    html = redraw_html(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'])
+
+    convert_to_markdown.cache_clear()
+
+    return [
+        history,
+        html,
+        unique_id,
+        gr.update(visible=False),
+        gr.update(visible=True),
+        gr.update(visible=False)
+    ]
+
+
+def handle_branch_chat_click(state):
+    history = state['history']
+    new_unique_id = datetime.now().strftime('%Y%m%d-%H-%M-%S')
+    save_history(history, new_unique_id, state['character_menu'], state['mode'])
+
+    histories = find_all_histories_with_first_prompts(state)
+    html = redraw_html(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'])
+
+    convert_to_markdown.cache_clear()
+
+    past_chats_update = gr.update(choices=histories, value=new_unique_id)
+
+    return [history, html, past_chats_update]
+
+
+def handle_rename_chat_click():
+    return [
+        gr.update(value="My New Chat"),
+        gr.update(visible=True),
+    ]
+
+
+def handle_rename_chat_confirm(rename_to, state):
+    rename_history(state['unique_id'], rename_to, state['character_menu'], state['mode'])
+    histories = find_all_histories_with_first_prompts(state)
+
+    return [
+        gr.update(choices=histories, value=rename_to),
+        gr.update(visible=False),
+    ]
+
+
+def handle_search_chat_change(state):
+    histories = find_all_histories_with_first_prompts(state)
+    return gr.update(choices=histories)
+
+
+def handle_upload_chat_history(load_chat_history, state):
+    history = start_new_chat(state)
+    history = load_history_json(load_chat_history, history)
+    save_history(history, state['unique_id'], state['character_menu'], state['mode'])
+    histories = find_all_histories_with_first_prompts(state)
+
+    html = redraw_html(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'])
+
+    convert_to_markdown.cache_clear()
+
+    if len(histories) > 0:
+        past_chats_update = gr.update(choices=histories, value=histories[0][1])
+    else:
+        past_chats_update = gr.update(choices=histories)
+
+    return [
+        history,
+        html,
+        past_chats_update
+    ]
+
+
+def handle_character_menu_change(state):
+    name1, name2, picture, greeting, context = load_character(state['character_menu'], state['name1'], state['name2'])
+
+    state['name1'] = name1
+    state['name2'] = name2
+    state['character_picture'] = picture
+    state['greeting'] = greeting
+    state['context'] = context
+
+    history = load_latest_history(state)
+    histories = find_all_histories_with_first_prompts(state)
+    html = redraw_html(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'])
+
+    convert_to_markdown.cache_clear()
+
+    if len(histories) > 0:
+        past_chats_update = gr.update(choices=histories, value=histories[0][1])
+    else:
+        past_chats_update = gr.update(choices=histories)
+
+    return [
+        history,
+        html,
+        name1,
+        name2,
+        picture,
+        greeting,
+        context,
+        past_chats_update,
+    ]
+
+
+def handle_mode_change(state):
+    history = load_latest_history(state)
+    histories = find_all_histories_with_first_prompts(state)
+    html = redraw_html(history, state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'])
+
+    convert_to_markdown.cache_clear()
+
+    if len(histories) > 0:
+        past_chats_update = gr.update(choices=histories, value=histories[0][1])
+    else:
+        past_chats_update = gr.update(choices=histories)
+
+    return [
+        history,
+        html,
+        gr.update(visible=state['mode'] != 'instruct'),
+        gr.update(visible=state['mode'] == 'chat-instruct'),
+        past_chats_update
+    ]
+
+
+def handle_save_character_click(name2):
+    return [
+        name2,
+        gr.update(visible=True)
+    ]
+
+
+def handle_load_template_click(instruction_template):
+    output = load_instruction_template(instruction_template)
+    return [
+        output,
+        "Select template to load..."
+    ]
+
+
+def handle_save_template_click(instruction_template_str):
+    contents = generate_instruction_template_yaml(instruction_template_str)
+    return [
+        "My Template.yaml",
+        "instruction-templates/",
+        contents,
+        gr.update(visible=True)
+    ]
+
+
+def handle_delete_template_click(template):
+    return [
+        f"{template}.yaml",
+        "instruction-templates/",
+        gr.update(visible=False)
+    ]
+
+
+def handle_your_picture_change(picture, state):
+    upload_your_profile_picture(picture)
+    html = redraw_html(state['history'], state['name1'], state['name2'], state['mode'], state['chat_style'], state['character_menu'], reset_cache=True)
+
+    return html
+
+
+def handle_send_instruction_click(state):
+    state['mode'] = 'instruct'
+    state['history'] = {'internal': [], 'visible': []}
+
+    output = generate_chat_prompt("Input", state)
+
+    return output
+
+
+def handle_send_chat_click(state):
+    output = generate_chat_prompt("", state, _continue=True)
+
+    return output

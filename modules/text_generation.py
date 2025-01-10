@@ -1,17 +1,23 @@
 import ast
 import copy
 import html
+import pprint
 import random
-import re
 import time
 import traceback
 
 import numpy as np
 import torch
 import transformers
-from transformers import LogitsProcessorList, is_torch_xpu_available
+from transformers import (
+    LogitsProcessorList,
+    is_torch_npu_available,
+    is_torch_xpu_available
+)
 
 import modules.shared as shared
+from modules import models, sampler_hijack
+from modules.cache_utils import process_llamacpp_cache
 from modules.callbacks import (
     Iteratorize,
     Stream,
@@ -20,17 +26,23 @@ from modules.callbacks import (
 from modules.extensions import apply_extensions
 from modules.grammar.grammar_utils import initialize_grammar
 from modules.grammar.logits_process import GrammarConstrainedLogitsProcessor
-from modules.html_generator import generate_4chan_html, generate_basic_html
+from modules.html_generator import generate_basic_html
 from modules.logging_colors import logger
-from modules.models import clear_torch_cache, local_rank
+from modules.models import clear_torch_cache, get_device, load_model
+
+sampler_hijack.hijack_samplers()
 
 
 def generate_reply(*args, **kwargs):
+    if shared.args.idle_timeout > 0 and shared.model is None and shared.model_name not in [None, 'None']:
+        shared.model, shared.tokenizer = load_model(shared.model_name)
+
     shared.generation_lock.acquire()
     try:
         for result in _generate_reply(*args, **kwargs):
             yield result
     finally:
+        models.last_generation_time = time.time()
         shared.generation_lock.release()
 
 
@@ -44,10 +56,14 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escap
             yield ''
             return
 
-        if shared.model.__class__.__name__ in ['LlamaCppModel', 'Exllamav2Model', 'CtransformersModel']:
+        if shared.model.__class__.__name__ in ['LlamaCppModel', 'Exllamav2Model', 'TensorRTLLMModel']:
             generate_func = generate_reply_custom
         else:
             generate_func = generate_reply_HF
+
+    if generate_func != generate_reply_HF and shared.args.verbose:
+        logger.info("PROMPT=")
+        print_prompt(question)
 
     # Prepare the input
     original_question = question
@@ -64,11 +80,7 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escap
         if type(st) is list and len(st) > 0:
             all_stop_strings += st
 
-    if shared.args.verbose:
-        print(f'\n\n{question}\n--------------------\n')
-
     shared.stop_everything = False
-    clear_torch_cache()
     seed = set_manual_seed(state['seed'])
     last_update = -1
     reply = ''
@@ -86,10 +98,11 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escap
         reply, stop_found = apply_stopping_strings(reply, all_stop_strings)
         if escape_html:
             reply = html.escape(reply)
+
         if is_stream:
             cur_time = time.time()
 
-            # Maximum number of tokens/second
+            # Limit number of tokens/second to make text readable in real time
             if state['max_tokens_second'] > 0:
                 diff = 1 / state['max_tokens_second'] - (cur_time - last_update)
                 if diff > 0:
@@ -105,6 +118,8 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escap
                     last_update = cur_time
                     yield reply
 
+                yield reply
+
         if stop_found or (state['max_tokens_second'] > 0 and shared.stop_everything):
             break
 
@@ -118,31 +133,40 @@ def encode(prompt, add_special_tokens=True, add_bos_token=True, truncation_lengt
     if shared.tokenizer is None:
         raise ValueError('No tokenizer is loaded')
 
-    if shared.model.__class__.__name__ in ['LlamaCppModel', 'CtransformersModel', 'Exllamav2Model']:
+    if shared.model.__class__.__name__ in ['LlamaCppModel', 'Exllamav2Model', 'TensorRTLLMModel']:
         input_ids = shared.tokenizer.encode(str(prompt))
         if shared.model.__class__.__name__ not in ['Exllamav2Model']:
             input_ids = np.array(input_ids).reshape(1, len(input_ids))
     else:
         input_ids = shared.tokenizer.encode(str(prompt), return_tensors='pt', add_special_tokens=add_special_tokens)
-        if not add_bos_token:
-            while len(input_ids[0]) > 0 and input_ids[0][0] == shared.tokenizer.bos_token_id:
-                input_ids = input_ids[:, 1:]
+
+        if hasattr(shared.tokenizer, 'bos_token_id') and shared.tokenizer.bos_token_id is not None:
+            if add_bos_token:
+                if (len(input_ids[0]) > 0 and input_ids[0][0] != shared.tokenizer.bos_token_id) or len(input_ids[0]) == 0:
+                    # Add a missing bos token (it may not have been added due to faulty model metadata)
+                    bos_tensor = torch.tensor([[shared.tokenizer.bos_token_id]])
+                    input_ids = torch.cat((bos_tensor, input_ids), 1)
+
+                # Prevent double bos token due to jinja templates with <s> somewhere
+                while len(input_ids[0]) > 1 and input_ids[0][0] == shared.tokenizer.bos_token_id and input_ids[0][1] == shared.tokenizer.bos_token_id:
+                    input_ids = input_ids[:, 1:]
+            else:
+                # Remove any bos token that may have been added
+                while len(input_ids[0]) > 0 and input_ids[0][0] == shared.tokenizer.bos_token_id:
+                    input_ids = input_ids[:, 1:]
 
     # Handling truncation
     if truncation_length is not None:
         input_ids = input_ids[:, -truncation_length:]
 
-    if shared.model.__class__.__name__ in ['LlamaCppModel', 'Exllamav2Model', 'CtransformersModel'] or shared.args.cpu:
+    if shared.model.__class__.__name__ in ['LlamaCppModel', 'Exllamav2Model', 'TensorRTLLMModel'] or shared.args.cpu:
         return input_ids
-    elif shared.args.deepspeed:
-        return input_ids.to(device=local_rank)
-    elif torch.backends.mps.is_available():
-        device = torch.device('mps')
-        return input_ids.to(device)
-    elif is_torch_xpu_available():
-        return input_ids.to("xpu:0")
     else:
-        return input_ids.cuda()
+        device = get_device()
+        if device:
+            return input_ids.to(device)
+
+        return input_ids
 
 
 def decode(output_ids, skip_special_tokens=True):
@@ -190,37 +214,7 @@ def generate_reply_wrapper(question, state, stopping_strings=None):
 
 
 def formatted_outputs(reply, model_name):
-    if any(s in model_name for s in ['gpt-4chan', 'gpt4chan']):
-        reply = fix_gpt4chan(reply)
-        return html.unescape(reply), generate_4chan_html(reply)
-    else:
-        return html.unescape(reply), generate_basic_html(reply)
-
-
-def fix_gpt4chan(s):
-    """
-    Removes empty replies from gpt4chan outputs
-    """
-    for i in range(10):
-        s = re.sub("--- [0-9]*\n>>[0-9]*\n---", "---", s)
-        s = re.sub("--- [0-9]*\n *\n---", "---", s)
-        s = re.sub("--- [0-9]*\n\n\n---", "---", s)
-
-    return s
-
-
-def fix_galactica(s):
-    """
-    Fix the LaTeX equations in GALACTICA
-    """
-    s = s.replace(r'\[', r'$')
-    s = s.replace(r'\]', r'$')
-    s = s.replace(r'\(', r'$')
-    s = s.replace(r'\)', r'$')
-    s = s.replace(r'$$', r'$')
-    s = re.sub(r'\n', r'\n\n', s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s
+    return html.unescape(reply), generate_basic_html(reply)
 
 
 def set_manual_seed(seed):
@@ -233,6 +227,8 @@ def set_manual_seed(seed):
         torch.cuda.manual_seed_all(seed)
     elif is_torch_xpu_available():
         torch.xpu.manual_seed_all(seed)
+    elif is_torch_npu_available():
+        torch.npu.manual_seed_all(seed)
 
     return seed
 
@@ -266,14 +262,19 @@ def apply_stopping_strings(reply, all_stop_strings):
     return reply, stop_found
 
 
-def get_reply_from_output_ids(output_ids, state, starting_from=0):
-    reply = decode(output_ids[starting_from:], state['skip_special_tokens'])
+def get_reply_from_output_ids(output_ids, state=None, starting_from=0):
+    reply = decode(output_ids[starting_from:], state['skip_special_tokens'] if state else True)
 
     # Handle tokenizers that do not add the leading space for the first token
     if (hasattr(shared.tokenizer, 'convert_ids_to_tokens') and len(output_ids) > starting_from) and not reply.startswith(' '):
         first_token = shared.tokenizer.convert_ids_to_tokens(int(output_ids[starting_from]))
         if isinstance(first_token, (bytes,)):
-            first_token = first_token.decode('utf8')
+            # try to decode the bytes to a string
+            # if it fails, which means it's not a string in this turn, just ignore it
+            try:
+                first_token = first_token.decode('utf8')
+            except UnicodeDecodeError:
+                first_token = ''
 
         if first_token.startswith('▁'):
             reply = ' ' + reply
@@ -282,12 +283,27 @@ def get_reply_from_output_ids(output_ids, state, starting_from=0):
 
 
 def generate_reply_HF(question, original_question, seed, state, stopping_strings=None, is_chat=False):
+    if shared.args.loader == 'Transformers':
+        clear_torch_cache()
+
     generate_params = {}
-    for k in ['max_new_tokens', 'do_sample', 'temperature', 'temperature_last', 'top_p', 'min_p', 'typical_p', 'repetition_penalty', 'presence_penalty', 'frequency_penalty', 'repetition_penalty_range', 'encoder_repetition_penalty', 'top_k', 'min_length', 'no_repeat_ngram_size', 'num_beams', 'penalty_alpha', 'length_penalty', 'early_stopping', 'tfs', 'top_a', 'mirostat_mode', 'mirostat_tau', 'mirostat_eta', 'guidance_scale']:
-        generate_params[k] = state[k]
+    for k in ['max_new_tokens', 'temperature', 'temperature_last', 'dynamic_temperature', 'dynatemp_low', 'dynatemp_high', 'dynatemp_exponent', 'smoothing_factor', 'smoothing_curve', 'top_p', 'min_p', 'top_k', 'repetition_penalty', 'presence_penalty', 'frequency_penalty', 'repetition_penalty_range', 'typical_p', 'tfs', 'top_a', 'guidance_scale', 'penalty_alpha', 'mirostat_mode', 'mirostat_tau', 'mirostat_eta', 'do_sample', 'encoder_repetition_penalty', 'no_repeat_ngram_size', 'dry_multiplier', 'dry_base', 'dry_allowed_length', 'dry_sequence_breakers', 'xtc_threshold', 'xtc_probability']:
+        if k in state:
+            generate_params[k] = state[k]
+
+    if isinstance(state['sampler_priority'], list) and len(state['sampler_priority']) > 0:
+        generate_params['sampler_priority'] = state['sampler_priority']
+    elif isinstance(state['sampler_priority'], str) and state['sampler_priority'].strip() != '':
+        generate_params['sampler_priority'] = [x.strip() for x in state['sampler_priority'].replace('\n', ',').split(',') if x.strip()]
 
     if state['negative_prompt'] != '':
         generate_params['negative_prompt_ids'] = encode(state['negative_prompt'])
+
+    if state['prompt_lookup_num_tokens'] > 0:
+        generate_params['prompt_lookup_num_tokens'] = state['prompt_lookup_num_tokens']
+
+    if state['static_cache']:
+        generate_params['cache_implementation'] = 'static'
 
     for k in ['epsilon_cutoff', 'eta_cutoff']:
         if state[k] > 0:
@@ -311,7 +327,6 @@ def generate_reply_HF(question, original_question, seed, state, stopping_strings
     # Encode the input
     input_ids = encode(question, add_bos_token=state['add_bos_token'], truncation_length=get_max_prompt_length(state))
     output = input_ids[0]
-    cuda = not any((shared.args.cpu, shared.args.deepspeed))
     if state['auto_max_new_tokens']:
         generate_params['max_new_tokens'] = state['truncation_length'] - input_ids.shape[-1]
 
@@ -342,6 +357,21 @@ def generate_reply_HF(question, original_question, seed, state, stopping_strings
     apply_extensions('logits_processor', processor, input_ids)
     generate_params['logits_processor'] = processor
 
+    if shared.args.verbose:
+        logger.info("GENERATE_PARAMS=")
+        filtered_params = {key: value for key, value in generate_params.items() if not isinstance(value, torch.Tensor)}
+        pprint.PrettyPrinter(indent=4, sort_dicts=False).pprint(filtered_params)
+        print()
+
+        logger.info("PROMPT=")
+        print_prompt(decode(input_ids[0], skip_special_tokens=False))
+
+    # Handle StreamingLLM for llamacpp_HF
+    if shared.model.__class__.__name__ == 'LlamacppHF' and shared.args.streaming_llm:
+        tmp = process_llamacpp_cache(shared.model.model, input_ids[-1].tolist(), shared.model.model._input_ids.tolist())
+        shared.model.past_seq = torch.tensor(tmp)
+        shared.model.save_cache()
+
     t0 = time.time()
     try:
         if not is_chat and not shared.is_seq2seq:
@@ -351,8 +381,9 @@ def generate_reply_HF(question, original_question, seed, state, stopping_strings
         if not state['stream']:
             with torch.no_grad():
                 output = shared.model.generate(**generate_params)[0]
-                if cuda:
-                    output = output.cuda()
+                device = get_device()
+                if device:
+                    output = output.to(device)
 
             starting_from = 0 if shared.is_seq2seq else len(input_ids[0])
             yield get_reply_from_output_ids(output, state, starting_from=starting_from)
@@ -363,7 +394,6 @@ def generate_reply_HF(question, original_question, seed, state, stopping_strings
 
             def generate_with_callback(callback=None, *args, **kwargs):
                 kwargs['stopping_criteria'].append(Stream(callback_func=callback))
-                clear_torch_cache()
                 with torch.no_grad():
                     shared.model.generate(**kwargs)
 
@@ -423,3 +453,18 @@ def generate_reply_custom(question, original_question, seed, state, stopping_str
         new_tokens = len(encode(original_question + reply)[0]) - original_tokens
         print(f'Output generated in {(t1-t0):.2f} seconds ({new_tokens/(t1-t0):.2f} tokens/s, {new_tokens} tokens, context {original_tokens}, seed {seed})')
         return
+
+
+def print_prompt(prompt, max_chars=2000):
+    DARK_YELLOW = "\033[38;5;3m"
+    RESET = "\033[0m"
+
+    if len(prompt) > max_chars:
+        half_chars = max_chars // 2
+        hidden_len = len(prompt[half_chars:-half_chars])
+        hidden_msg = f"{DARK_YELLOW}[...{hidden_len} characters hidden...]{RESET}"
+        print(prompt[:half_chars] + hidden_msg + prompt[-half_chars:])
+    else:
+        print(prompt)
+
+    print()

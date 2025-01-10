@@ -1,14 +1,38 @@
-import torch
-from transformers import is_torch_xpu_available
+import time
+import traceback
 
-from modules import sampler_hijack, shared
+import torch
+
+from modules import models, sampler_hijack, shared
 from modules.logging_colors import logger
+from modules.models import get_device, load_model
 from modules.text_generation import generate_reply
 
 global_scores = None
 
 
-def get_next_logits(prompt, state, use_samplers, previous, top_logits=50, return_dict=False):
+def get_next_logits(*args, **kwargs):
+    if shared.args.idle_timeout > 0 and shared.model is None and shared.model_name not in [None, 'None']:
+        shared.model, shared.tokenizer = load_model(shared.model_name)
+
+    needs_lock = not args[2]  # use_samplers
+    if needs_lock:
+        shared.generation_lock.acquire()
+
+    try:
+        result = _get_next_logits(*args, **kwargs)
+    except Exception:
+        traceback.print_exc()
+        result = None
+
+    if needs_lock:
+        models.last_generation_time = time.time()
+        shared.generation_lock.release()
+
+    return result
+
+
+def _get_next_logits(prompt, state, use_samplers, previous, top_logits=25, return_dict=False):
     if shared.model is None:
         logger.error("No model is loaded! Select one in the Model tab.")
         return 'Error: No model is loaded1 Select one in the Model tab.', previous
@@ -32,19 +56,21 @@ def get_next_logits(prompt, state, use_samplers, previous, top_logits=50, return
         scores = sampler_hijack.global_scores[-1]
     else:
         if is_non_hf_exllamav2:
-            if is_torch_xpu_available():
-                tokens = shared.tokenizer.encode(prompt).to("xpu:0")
-            else:
-                tokens = shared.tokenizer.encode(prompt).cuda()
+            device = get_device()
+            tokens = shared.tokenizer.encode(prompt)
+            if device:
+                tokens = tokens.to(device)
+
             scores = shared.model.get_logits(tokens)[-1][-1]
         elif is_non_hf_llamacpp:
             tokens = shared.tokenizer.encode(prompt)
             scores = shared.model.get_logits(tokens)[-1][-1]
         else:
-            if is_torch_xpu_available():
-                tokens = shared.tokenizer.encode(prompt, return_tensors='pt').to("xpu:0")
-            else:
-                tokens = shared.tokenizer.encode(prompt, return_tensors='pt').cuda()
+            device = get_device()
+            tokens = shared.tokenizer.encode(prompt, return_tensors='pt')
+            if device:
+                tokens = tokens.to(device)
+
             output = shared.model(input_ids=tokens)
             scores = output['logits'][-1][-1]
 
@@ -62,7 +88,14 @@ def get_next_logits(prompt, state, use_samplers, previous, top_logits=50, return
         topk_values = [float(i) for i in topk_values]
         output = {}
         for row in list(zip(topk_values, tokens)):
-            output[row[1]] = row[0]
+            key = row[1]
+            if isinstance(key, bytes):
+                try:
+                    key = key.decode()
+                except:
+                    key = key.decode('latin')
+
+            output[key] = row[0]
 
         return output
     else:

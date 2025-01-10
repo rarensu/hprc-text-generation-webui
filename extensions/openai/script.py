@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import traceback
+from collections import deque
 from threading import Thread
 
 import speech_recognition as sr
@@ -31,6 +32,7 @@ from modules.text_generation import stop_everything_event
 from .typing import (
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatPromptResponse,
     CompletionRequest,
     CompletionResponse,
     DecodeRequest,
@@ -174,13 +176,13 @@ async def handle_audio_transcription(request: Request):
 
     # Create AudioData object
     audio_data = sr.AudioData(raw_data, audio_data.frame_rate, audio_data.sample_width)
-    whipser_language = form.getvalue('language', None)
-    whipser_model = form.getvalue('model', 'tiny')  # Use the model from the form data if it exists, otherwise default to tiny
+    whisper_language = form.getvalue('language', None)
+    whisper_model = form.getvalue('model', 'tiny')  # Use the model from the form data if it exists, otherwise default to tiny
 
     transcription = {"text": ""}
 
     try:
-        transcription["text"] = r.recognize_whisper(audio_data, language=whipser_language, model=whipser_model)
+        transcription["text"] = r.recognize_whisper(audio_data, language=whisper_language, model=whisper_model)
     except sr.UnknownValueError:
         print("Whisper could not understand audio")
         transcription["text"] = "Whisper could not understand audio UnknownValueError"
@@ -256,6 +258,15 @@ async def handle_logits(request_data: LogitsRequest):
     The keys are the tokens, and the values are the probabilities.
     '''
     response = OAIlogits._get_next_logits(to_dict(request_data))
+    return JSONResponse(response)
+
+
+@app.post('/v1/internal/chat-prompt', response_model=ChatPromptResponse, dependencies=check_key)
+async def handle_chat_prompt(request: Request, request_data: ChatCompletionRequest):
+    path = request.url.path
+    is_legacy = "/generate" in path
+    generator = OAIcompletions.chat_completions_common(to_dict(request_data), is_legacy=is_legacy, prompt_only=True)
+    response = deque(generator, maxlen=1).pop()
     return JSONResponse(response)
 
 
@@ -342,23 +353,38 @@ async def handle_unload_loras():
 
 
 def run_server():
-    server_addr = '0.0.0.0' if shared.args.listen else '127.0.0.1'
+    # Parse configuration
     port = int(os.environ.get('OPENEDAI_PORT', shared.args.api_port))
-
     ssl_certfile = os.environ.get('OPENEDAI_CERT_PATH', shared.args.ssl_certfile)
     ssl_keyfile = os.environ.get('OPENEDAI_KEY_PATH', shared.args.ssl_keyfile)
 
+    # In the server configuration:
+    server_addrs = []
+    if os.environ.get('OPENEDAI_ENABLE_IPV6', shared.args.api_enable_ipv6):
+        server_addrs.append('[::]' if shared.args.listen else '[::1]')
+    if not os.environ.get('OPENEDAI_DISABLE_IPV4', shared.args.api_disable_ipv4):
+        server_addrs.append('0.0.0.0' if shared.args.listen else '127.0.0.1')
+
+    if not server_addrs:
+        raise Exception('you MUST enable IPv6 or IPv4 for the API to work')
+
+    # Log server information
     if shared.args.public_api:
-        def on_start(public_url: str):
-            logger.info(f'OpenAI-compatible API URL:\n\n{public_url}\n')
-
-        _start_cloudflared(port, shared.args.public_api_id, max_attempts=3, on_start=on_start)
+        _start_cloudflared(
+            port,
+            shared.args.public_api_id,
+            max_attempts=3,
+            on_start=lambda url: logger.info(f'OpenAI-compatible API URL:\n\n{url}\n')
+        )
     else:
-        if ssl_keyfile and ssl_certfile:
-            logger.info(f'OpenAI-compatible API URL:\n\nhttps://{server_addr}:{port}\n')
+        url_proto = 'https://' if (ssl_certfile and ssl_keyfile) else 'http://'
+        urls = [f'{url_proto}{addr}:{port}' for addr in server_addrs]
+        if len(urls) > 1:
+            logger.info('OpenAI-compatible API URLs:\n\n' + '\n'.join(urls) + '\n')
         else:
-            logger.info(f'OpenAI-compatible API URL:\n\nhttp://{server_addr}:{port}\n')
+            logger.info('OpenAI-compatible API URL:\n\n' + '\n'.join(urls) + '\n')
 
+    # Log API keys
     if shared.args.api_key:
         if not shared.args.admin_key:
             shared.args.admin_key = shared.args.api_key
@@ -368,8 +394,9 @@ def run_server():
     if shared.args.admin_key and shared.args.admin_key != shared.args.api_key:
         logger.info(f'OpenAI API admin key (for loading/unloading models):\n\n{shared.args.admin_key}\n')
 
+    # Start server
     logging.getLogger("uvicorn.error").propagate = False
-    uvicorn.run(app, host=server_addr, port=port, ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile)
+    uvicorn.run(app, host=server_addrs, port=port, ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile)
 
 
 def setup():
