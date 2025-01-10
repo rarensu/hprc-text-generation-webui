@@ -53,9 +53,10 @@ else
     git checkout HPRC
     git remote set-url origin https://github.com/oobabooga/text-generation-webui.git
     # linking llama-2 model from source
-    if [[ $LINK_THIS_MODEL ]]
+    if [[ -n "$LINK_THIS_MODEL" ]]
     then
-        ln -s $T_ROOT/$LINK_THIS_MODEL models/$LINK_THIS_MODEL
+        local model_path=$(readlink -e $T_ROOT/$LINK_THIS_MODEL)
+        ln -s $model_path models/$LINK_THIS_MODEL
     fi
 fi
 
