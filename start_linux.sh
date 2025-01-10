@@ -33,8 +33,9 @@ fi
 export PYTHONNOUSERSITE=1
 unset PYTHONPATH
 unset PYTHONHOME
-#export CUDA_PATH="$INSTALL_ENV_DIR"
-#export CUDA_HOME="$CUDA_PATH"
+
+# Your Hugging Face Token Here
+#export HF_TOKEN=
 
 # activate installer env
 source  $VENV_DIR/bin/activate 

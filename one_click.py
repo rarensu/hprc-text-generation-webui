@@ -91,7 +91,8 @@ def torch_version():
             site_packages_path = sitedir
             break
 
-    if site_packages_path:
+    #if site_packages_path:
+    if False:
         torch_version_file = open(os.path.join(site_packages_path, 'torch', 'version.py')).read().splitlines()
         torver = [line for line in torch_version_file if line.startswith('__version__')][0].split('__version__ = ')[1].strip("'")
     else:
@@ -144,7 +145,7 @@ def is_installed():
 
 def check_env():
     # If we have access to pip, we are probably in an environment
-    pip_exist = run_cmd("pip", environment=True, capture_output=True).returncode == 0
+    pip_exist = run_cmd("pip --version", environment=True).returncode == 0
     if not pip_exist:
         print("Pip is not installed. Exiting...")
         sys.exit(1)
@@ -316,7 +317,7 @@ def install_webui():
 
     # Install Git and then Pytorch
     print_big_message("Installing PyTorch.")
-    run_cmd(f"{install_pytorch} && python -m pip install py-cpuinfo==9.0.0", assert_success=True, environment=True)
+    run_cmd(f"echo '(skipped)' {install_pytorch} && python -m pip install py-cpuinfo==9.0.0", assert_success=True, environment=True)
 
     # Install CUDA libraries (this wasn't necessary for Pytorch before...)
     #if selected_gpu == "NVIDIA":
