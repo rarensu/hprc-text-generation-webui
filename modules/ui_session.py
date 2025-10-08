@@ -7,6 +7,7 @@ from modules.utils import gradio
 def create_ui():
     mu = shared.args.multi_user
     with gr.Tab("Session", elem_id="session-tab"):
+        shared.gradio['session-top-row']=gr.Row()
         with gr.Row():
             with gr.Column():
                 gr.Markdown("## Settings")

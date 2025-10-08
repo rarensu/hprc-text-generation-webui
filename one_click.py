@@ -22,7 +22,7 @@ LIBSTDCXX_VERSION_LINUX = "12.1.0"
 
 # Environment
 script_dir = os.getcwd()
-conda_env_path = os.path.join(script_dir, "installer_files", "env")
+python_venv_path = os.path.join(script_dir, "installer_files", "venv")
 state_file = '.installer_state.json'
 
 # Command-line flags
@@ -99,6 +99,19 @@ def save_state(state):
     with open(state_file, 'w') as f:
         json.dump(state, f)
 
+def torch_version():
+    site_packages_path = None
+    for sitedir in site.getsitepackages():
+        if "site-packages" in sitedir and python_venv_path in sitedir:
+            site_packages_path = sitedir
+            break
+
+    #if site_packages_path:
+    if False:
+        torch_version_file = open(os.path.join(site_packages_path, 'torch', 'version.py')).read().splitlines()
+        torver = [line for line in torch_version_file if line.startswith('__version__')][0].split('__version__ = ')[1].strip("'")
+    else:
+        from torch import __version__ as torver
 
 def get_gpu_choice():
     """Get GPU choice from state file or ask user"""
@@ -166,6 +179,13 @@ def get_pytorch_update_command(gpu_choice):
     else:
         return base_cmd
 
+def is_installed():
+    site_packages_path = None
+    for sitedir in site.getsitepackages():
+        if "site-packages" in sitedir and python_venv_path in sitedir:
+            site_packages_path = sitedir
+            break
+    return os.path.isdir(python_venv_path)
 
 def get_requirements_file(gpu_choice):
     """Get requirements file path based on GPU choice"""
@@ -181,7 +201,6 @@ def get_requirements_file(gpu_choice):
         file_name = f"requirements_cpu_only{'_noavx2' if not cpu_has_avx2() else ''}.txt"
     else:
         raise ValueError(f"Unknown GPU choice: {gpu_choice}")
-
     return os.path.join(requirements_base, file_name)
 
 
@@ -195,35 +214,27 @@ def get_extensions_names():
 
 
 def check_env():
-    # If we have access to conda, we are probably in an environment
-    conda_exist = run_cmd("conda", environment=True, capture_output=True).returncode == 0
-    if not conda_exist:
-        print("Conda is not installed. Exiting...")
+    # If we have access to pip, we are probably in an environment
+    pip_exist = run_cmd("pip --version", environment=True).returncode == 0
+    if not pip_exist:
+        print("Pip is not installed. Exiting...")
         sys.exit(1)
 
     # Ensure this is a new environment and not the base environment
-    if os.environ.get("CONDA_DEFAULT_ENV", "") == "base":
+    if os.environ["VIRTUAL_ENV"] == None:
         print("Create an environment for this project and activate it. Exiting...")
         sys.exit(1)
 
 
 def clear_cache():
-    run_cmd("conda clean -a -y", environment=True)
+    #run_cmd("conda clean -a -y", environment=True)
     run_cmd("python -m pip cache purge", environment=True)
 
 
 def run_cmd(cmd, assert_success=False, environment=False, capture_output=False, env=None):
-    # Use the conda environment
+    # Use the virtual environment
     if environment:
-        if is_windows():
-            conda_bat_path = os.path.join(script_dir, "installer_files", "conda", "condabin", "conda.bat")
-            cmd = f'"{conda_bat_path}" activate "{conda_env_path}" >nul && {cmd}'
-        else:
-            conda_sh_path = os.path.join(script_dir, "installer_files", "conda", "etc", "profile.d", "conda.sh")
-            cmd = f'. "{conda_sh_path}" && conda activate "{conda_env_path}" && {cmd}'
-
-    # Set executable to None for Windows, bash for everything else
-    executable = None if is_windows() else 'bash'
+	    cmd = f'source "{python_venv_path}/bin/activate" && {cmd}'
 
     # Run shell commands
     result = subprocess.run(cmd, shell=True, capture_output=capture_output, env=env, executable=executable)
@@ -335,14 +346,7 @@ def install_webui():
     # Install Git and then Pytorch
     print_big_message("Installing PyTorch.")
     install_pytorch = get_pytorch_install_command(gpu_choice)
-    run_cmd(f"conda install -y ninja git && {install_pytorch} && python -m pip install py-cpuinfo==9.0.0", assert_success=True, environment=True)
-
-    if gpu_choice == "INTEL":
-        # Install oneAPI dependencies via conda
-        print_big_message("Installing Intel oneAPI runtime libraries.")
-        run_cmd("conda install -y -c https://software.repos.intel.com/python/conda/ -c conda-forge dpcpp-cpp-rt=2024.0 mkl-dpcpp=2024.0", environment=True)
-        # Install libuv required by Intel-patched torch
-        run_cmd("conda install -y libuv", environment=True)
+    run_cmd(f"echo '(skipped)' {install_pytorch} && python -m pip install py-cpuinfo==9.0.0", assert_success=True, environment=True)
 
     # Install the webui requirements
     update_requirements(initial_installation=True, pull=False)
@@ -481,7 +485,7 @@ def launch_webui():
 
 
 if __name__ == "__main__":
-    # Verifies we are in a conda environment
+    # Verifies we are in a virtual environment
     check_env()
 
     parser = argparse.ArgumentParser(add_help=False)
@@ -542,9 +546,9 @@ if __name__ == "__main__":
             print_big_message("You haven't downloaded any model yet.\nOnce the web UI launches, head over to the \"Model\" tab and download one.")
 
         # Workaround for llama-cpp-python loading paths in CUDA env vars even if they do not exist
-        conda_path_bin = os.path.join(conda_env_path, "bin")
-        if not os.path.exists(conda_path_bin):
-            os.mkdir(conda_path_bin)
+        venv_path_bin = os.path.join(python_venv_path, "bin")
+        if not os.path.exists(venv_path_bin):
+            os.mkdir(venv_path_bin)
 
         # Launch the webui
         launch_webui()
