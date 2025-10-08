@@ -5,7 +5,6 @@ import random
 
 import torch
 import transformers
-from transformers import LogitsWarper
 from transformers.generation.logits_process import (
     LogitNormalization,
     LogitsProcessor,
@@ -14,12 +13,15 @@ from transformers.generation.logits_process import (
 
 from modules import shared
 from modules.logging_colors import logger
-from modules.models import get_device
+from modules.torch_utils import get_device
+
+original_init = transformers.GenerationConfig.__init__
+original_get_logits_processor = transformers.GenerationMixin._get_logits_processor
 
 global_scores = None
 
 
-class TemperatureLogitsWarperCustom(LogitsWarper):
+class TemperatureLogitsWarperCustom(LogitsProcessor):
     '''
     A copy of the original Transformers temperature logits warper.
     '''
@@ -42,7 +44,7 @@ class TemperatureLogitsWarperCustom(LogitsWarper):
         return scores
 
 
-class DynamicTemperatureLogitsWarper(LogitsWarper):
+class DynamicTemperatureLogitsWarper(LogitsProcessor):
     '''
     Dynamic temperature.
     '''
@@ -100,7 +102,7 @@ class DynamicTemperatureLogitsWarper(LogitsWarper):
         return scores
 
 
-class QuadraticSamplingLogitsWarper(LogitsWarper):
+class QuadraticSamplingLogitsWarper(LogitsProcessor):
     '''
     Quadratic sampling with smoothing factor and smoothing curve parameters.
     '''
@@ -127,7 +129,7 @@ class QuadraticSamplingLogitsWarper(LogitsWarper):
         return transformed_logits
 
 
-class TailFreeLogitsWarper(LogitsWarper):
+class TailFreeLogitsWarper(LogitsProcessor):
     def __init__(self, tfs: float, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
         tfs = float(tfs)
         if tfs < 0 or tfs > 1.0:
@@ -167,7 +169,7 @@ class TailFreeLogitsWarper(LogitsWarper):
         return scores
 
 
-class TopALogitsWarper(LogitsWarper):
+class TopALogitsWarper(LogitsProcessor):
     def __init__(self, top_a: float, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
         top_a = float(top_a)
         if top_a < 0 or top_a > 1.0:
@@ -193,8 +195,48 @@ class TopALogitsWarper(LogitsWarper):
         return scores
 
 
+class TopNSigmaLogitsWarper(LogitsProcessor):
+    def __init__(self, n_sigma: float = 2.0, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
+        """
+        Initialize Top-nσ Sampling logits warper.
+
+        Args:
+            n_sigma: The threshold multiplier for standard deviation
+            filter_value: Value to assign to filtered logits
+            min_tokens_to_keep: Minimum number of tokens to keep
+        """
+        if n_sigma < 0:
+            raise ValueError(f"`n_sigma` must be a non-negative float, but is {n_sigma}")
+        self.n_sigma = n_sigma
+        self.filter_value = filter_value
+        self.min_tokens_to_keep = min_tokens_to_keep
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        # Calculate max of logits
+        max_logit = torch.max(scores, dim=-1, keepdim=True)[0]
+
+        # Calculate standard deviation only on finite values
+        finite_mask = torch.isfinite(scores)
+        finite_scores = scores.masked_fill(~finite_mask, 0.0)
+        std_logit = torch.std(finite_scores, dim=-1, keepdim=True)
+
+        # Create mask where tokens with logits >= max_logit - n_sigma * std_logit are kept
+        threshold = max_logit - self.n_sigma * std_logit
+        indices_to_remove = scores < threshold
+
+        if self.min_tokens_to_keep > 1:
+            # Keep at least min_tokens_to_keep tokens
+            top_k_indices = torch.topk(scores, self.min_tokens_to_keep, dim=-1)[1]
+            indices_to_remove.scatter_(-1, top_k_indices, False)
+
+        # Apply mask by setting filtered tokens to filter_value
+        scores = scores.masked_fill(indices_to_remove, self.filter_value)
+
+        return scores
+
+
 # Exclude Top Choices (XTC)
-class XTCLogitsWarper(LogitsWarper):
+class XTCLogitsWarper(LogitsProcessor):
     def __init__(self, threshold: float, probability: float, filter_value: float = -float("Inf")):
         self.threshold = threshold
         self.probability = probability
@@ -312,7 +354,7 @@ class DRYLogitsProcessor(LogitsProcessor):
         return scores
 
 
-class MirostatLogitsWarper(LogitsWarper):
+class MirostatLogitsWarper(LogitsProcessor):
     def __init__(self, mirostat_mode: int, mirostat_tau: float, mirostat_eta: float, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
         if mirostat_mode not in [2]:
             raise ValueError(f"`mirostat` has to be a an integer 2, but is {mirostat_mode}")
@@ -361,7 +403,7 @@ class MirostatLogitsWarper(LogitsWarper):
         return scores
 
 
-class SpyLogitsWarper(LogitsWarper):
+class SpyLogitsWarper(LogitsProcessor):
     def __init__(self):
         pass
 
@@ -445,7 +487,7 @@ def get_logits_processor_patch(self, **kwargs):
         generation_config.temperature = float(generation_config.temperature)  # Must be float
 
     # Get the original warpers
-    warpers = self._get_logits_processor_old(**kwargs)
+    warpers = original_get_logits_processor(self, **kwargs)
 
     for i in range(len(warpers) - 1, -1, -1):
         # Replace temperature with our modified class.
@@ -525,6 +567,14 @@ def get_logits_processor_patch(self, **kwargs):
             )
         )
 
+    if generation_config.top_n_sigma is not None and generation_config.top_n_sigma > 0.0:
+        warpers_to_add.append(
+            TopNSigmaLogitsWarper(
+                n_sigma=generation_config.top_n_sigma,
+                min_tokens_to_keep=min_tokens_to_keep
+            )
+        )
+
     if generation_config.xtc_probability is not None and generation_config.xtc_probability > 0:
         warpers_to_add.append(
             XTCLogitsWarper(
@@ -589,6 +639,7 @@ def get_logits_processor_patch(self, **kwargs):
         'TailFreeLogitsWarper': 'tfs',
         'TemperatureLogitsWarperCustom': 'temperature',
         'TopALogitsWarper': 'top_a',
+        'TopNSigmaLogitsWarper': 'top_n_sigma',
         'TopKLogitsWarper': 'top_k',
         'TopPLogitsWarper': 'top_p',
         'TypicalLogitsWarper': 'typical_p',
@@ -626,7 +677,7 @@ def get_logits_processor_patch(self, **kwargs):
 
 
 def generation_config_init_patch(self, **kwargs):
-    self.__init___old(**kwargs)
+    original_init(self, **kwargs)
     self.min_p = kwargs.pop("min_p", 0.0)
     self.dynamic_temperature = kwargs.pop("dynamic_temperature", False)
     self.dynatemp_low = kwargs.pop("dynatemp_low", 1)
@@ -636,6 +687,7 @@ def generation_config_init_patch(self, **kwargs):
     self.smoothing_curve = kwargs.pop("smoothing_curve", 1.0)
     self.tfs = kwargs.pop("tfs", 1.0)
     self.top_a = kwargs.pop("top_a", 0.0)
+    self.top_n_sigma = kwargs.pop("top_n_sigma", 0.0)
     self.mirostat_mode = kwargs.pop("mirostat_mode", 0)
     self.mirostat_eta = kwargs.pop("mirostat_eta", 0.1)
     self.mirostat_tau = kwargs.pop("mirostat_tau", 5)
@@ -649,12 +701,9 @@ def generation_config_init_patch(self, **kwargs):
     self.xtc_threshold = kwargs.pop("xtc_threshold", 0.1)
     self.xtc_probability = kwargs.pop("xtc_probability", 0)
     self.temperature_last = kwargs.pop("temperature_last", False)
-    self.sampler_priority = kwargs.pop("sampler_priority", ['repetition_penalty', 'presence_penalty', 'frequency_penalty', 'dry', 'temperature', 'dynamic_temperature', 'quadratic_sampling', 'top_k', 'top_p', 'typical_p', 'epsilon_cutoff', 'eta_cutoff', 'tfs', 'top_a', 'min_p', 'mirostat', 'xtc', 'encoder_repetition_penalty', 'no_repeat_ngram'])
+    self.sampler_priority = kwargs.pop("sampler_priority", ['repetition_penalty', 'presence_penalty', 'frequency_penalty', 'dry', 'temperature', 'dynamic_temperature', 'quadratic_sampling', 'top_n_sigma', 'top_k', 'top_p', 'typical_p', 'epsilon_cutoff', 'eta_cutoff', 'tfs', 'top_a', 'min_p', 'mirostat', 'xtc', 'encoder_repetition_penalty', 'no_repeat_ngram'])
 
 
 def hijack_samplers():
-    transformers.GenerationMixin._get_logits_processor_old = transformers.GenerationMixin._get_logits_processor
     transformers.GenerationMixin._get_logits_processor = get_logits_processor_patch
-
-    transformers.GenerationConfig.__init___old = transformers.GenerationConfig.__init__
     transformers.GenerationConfig.__init__ = generation_config_init_patch

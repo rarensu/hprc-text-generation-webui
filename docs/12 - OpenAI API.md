@@ -1,6 +1,6 @@
 ## OpenAI compatible API
 
-The main API for this project is meant to be a drop-in replacement to the OpenAI API, including Chat and Completions endpoints. 
+The main API for this project is meant to be a drop-in replacement to the OpenAI API, including Chat and Completions endpoints.
 
 * It is 100% offline and private.
 * It doesn't create any logs.
@@ -14,7 +14,7 @@ Add `--api` to your command-line flags.
 * To create a public Cloudflare URL, add the `--public-api` flag.
 * To listen on your local network, add the `--listen` flag.
 * To change the port, which is 5000 by default, use `--api-port 1234` (change 1234 to your desired port number).
-* To use SSL, add `--ssl-keyfile key.pem --ssl-certfile cert.pem`. Note that it doesn't work with `--public-api`.
+* To use SSL, add `--ssl-keyfile key.pem --ssl-certfile cert.pem`. ⚠️ **Note**: this doesn't work with `--public-api` since Cloudflare already uses HTTPS by default.
 * To use an API key for authentication, add `--api-key yourkey`.
 
 ### Examples
@@ -30,10 +30,10 @@ curl http://127.0.0.1:5000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "This is a cake recipe:\n\n1.",
-    "max_tokens": 200,
-    "temperature": 1,
-    "top_p": 0.9,
-    "seed": 10
+    "max_tokens": 512,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20
   }'
 ```
 
@@ -51,8 +51,9 @@ curl http://127.0.0.1:5000/v1/chat/completions \
         "content": "Hello!"
       }
     ],
-    "mode": "instruct",
-    "instruction_template": "Alpaca"
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20
   }'
 ```
 
@@ -68,10 +69,75 @@ curl http://127.0.0.1:5000/v1/chat/completions \
         "content": "Hello! Who are you?"
       }
     ],
-    "mode": "chat",
-    "character": "Example"
+    "mode": "chat-instruct",
+    "character": "Example",
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20
   }'
 ```
+
+#### Multimodal/vision (llama.cpp and ExLlamaV3)
+
+##### With /v1/chat/completions (recommended!)
+
+```shell
+curl http://127.0.0.1:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": "Please describe what you see in this image."},
+          {"type": "image_url", "image_url": {"url": "https://github.com/turboderp-org/exllamav3/blob/master/examples/media/cat.png?raw=true"}}
+        ]
+      }
+    ],
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20
+  }'
+```
+
+For base64-encoded images, just replace the inner "url" value with this format: `data:image/FORMAT;base64,BASE64_STRING` where FORMAT is the file type (png, jpeg, gif, etc.) and BASE64_STRING is your base64-encoded image data.
+
+##### With /v1/completions
+
+```shell
+curl http://127.0.0.1:5000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "About image <__media__> and image <__media__>, what I can say is that the first one"
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://github.com/turboderp-org/exllamav3/blob/master/examples/media/cat.png?raw=true"
+            }
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://github.com/turboderp-org/exllamav3/blob/master/examples/media/strawberry.png?raw=true"
+            }
+          }
+        ]
+      }
+    ],
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20
+  }'
+```
+
+For base64-encoded images, just replace the inner "url" values with this format: `data:image/FORMAT;base64,BASE64_STRING` where FORMAT is the file type (png, jpeg, gif, etc.) and BASE64_STRING is your base64-encoded image data.
 
 #### SSE streaming
 
@@ -85,8 +151,9 @@ curl http://127.0.0.1:5000/v1/chat/completions \
         "content": "Hello!"
       }
     ],
-    "mode": "instruct",
-    "instruction_template": "Alpaca",
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
     "stream": true
   }'
 ```
@@ -127,13 +194,11 @@ curl -k http://127.0.0.1:5000/v1/internal/model/list \
 curl -k http://127.0.0.1:5000/v1/internal/model/load \
   -H "Content-Type: application/json" \
   -d '{
-    "model_name": "model_name",
+    "model_name": "Qwen_Qwen3-0.6B-Q4_K_M.gguf",
     "args": {
-      "load_in_4bit": true,
-      "n_gpu_layers": 12
-    },
-    "settings": {
-      "instruction_template": "Alpaca"
+      "ctx_size": 32768,
+      "flash_attn": true,
+      "cache_type": "q8_0"
     }
   }'
 ```
@@ -155,9 +220,10 @@ while True:
     user_message = input("> ")
     history.append({"role": "user", "content": user_message})
     data = {
-        "mode": "chat",
-        "character": "Example",
-        "messages": history
+        "messages": history,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20
     }
 
     response = requests.post(url, headers=headers, json=data, verify=False)
@@ -187,9 +253,11 @@ while True:
     user_message = input("> ")
     history.append({"role": "user", "content": user_message})
     data = {
-        "mode": "instruct",
         "stream": True,
-        "messages": history
+        "messages": history,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20
     }
 
     stream_response = requests.post(url, headers=headers, json=data, verify=False, stream=True)
@@ -198,7 +266,7 @@ while True:
     assistant_message = ''
     for event in client.events():
         payload = json.loads(event.data)
-        chunk = payload['choices'][0]['message']['content']
+        chunk = payload['choices'][0]['delta']['content']
         assistant_message += chunk
         print(chunk, end='')
 
@@ -223,10 +291,10 @@ headers = {
 
 data = {
     "prompt": "This is a cake recipe:\n\n1.",
-    "max_tokens": 200,
-    "temperature": 1,
-    "top_p": 0.9,
-    "seed": 10,
+    "max_tokens": 512,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
     "stream": True,
 }
 
@@ -239,6 +307,106 @@ for event in client.events():
     print(payload['choices'][0]['text'], end='')
 
 print()
+```
+
+#### Python example with API key
+
+Replace
+
+```python
+headers = {
+    "Content-Type": "application/json"
+}
+```
+
+with
+
+```python
+headers = {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer yourPassword123"
+}
+```
+
+in any of the examples above.
+
+#### Tool/Function Calling Example
+
+You need to use a model with tools support. The prompt will be automatically formatted using the model's Jinja2 template.
+
+Request:
+
+```
+curl http://127.0.0.1:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant."
+      },
+      {
+        "role": "user",
+        "content": "What time is it currently in New York City?"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_current_time",
+          "description": "Get current time in a specific timezones",
+          "parameters": {
+            "type": "object",
+            "required": ["timezone"],
+            "properties": {
+              "timezone": {
+                "type": "string",
+                "description": "IANA timezone name (e.g., America/New_York, Europe/London). Use Europe/Berlin as local timezone if no timezone provided by the user."
+              }
+            }
+          }
+        }
+      }
+    ]
+  }'
+```
+
+Sample response:
+
+```
+{
+    "id": "chatcmpl-1746532051477984256",
+    "object": "chat.completion",
+    "created": 1746532051,
+    "model": "qwen2.5-coder-14b-instruct-q4_k_m.gguf",
+    "choices": [
+        {
+            "index": 0,
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "```xml\n<function>\n{\n  \"name\": \"get_current_time\",\n  \"arguments\": {\n    \"timezone\": \"America/New_York\"\n  }\n}\n</function>\n```"
+            },
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_current_time",
+                        "arguments": "{\"timezone\": \"America/New_York\"}"
+                    },
+                    "id": "call_52ij07mh",
+                    "index": "0"
+                }
+            ]
+        }
+    ],
+    "usage": {
+        "prompt_tokens": 224,
+        "completion_tokens": 38,
+        "total_tokens": 262
+    }
+}
 ```
 
 ### Environment variables

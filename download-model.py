@@ -1,5 +1,5 @@
 '''
-Downloads models from Hugging Face to models/username_modelname.
+Downloads models from Hugging Face to user_data/models/username_modelname.
 
 Example:
 python download-model.py facebook/opt-1.3b
@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+from multiprocessing import Array
 from pathlib import Path
 from time import sleep
 
@@ -27,9 +28,11 @@ base = os.environ.get("HF_ENDPOINT") or "https://huggingface.co"
 
 
 class ModelDownloader:
-    def __init__(self, max_retries=5):
+    def __init__(self, max_retries=7):
         self.max_retries = max_retries
         self.session = self.get_session()
+        self._progress_bar_slots = None
+        self.progress_queue = None
 
     def get_session(self):
         session = requests.Session()
@@ -79,6 +82,7 @@ class ModelDownloader:
 
         links = []
         sha256 = []
+        file_sizes = []
         classifications = []
         has_pytorch = False
         has_pt = False
@@ -115,8 +119,14 @@ class ModelDownloader:
                 is_tokenizer = re.match(r"(tokenizer|ice|spiece).*\.model", fname) or is_tiktoken
                 is_text = re.match(r".*\.(txt|json|py|md)", fname) or is_tokenizer
                 if any((is_pytorch, is_safetensors, is_pt, is_gguf, is_tokenizer, is_text)):
+                    file_size = 0
                     if 'lfs' in dict[i]:
                         sha256.append([fname, dict[i]['lfs']['oid']])
+                        file_size = dict[i]['lfs'].get('size', 0)
+                    elif 'size' in dict[i]:
+                        file_size = dict[i]['size']
+
+                    file_sizes.append(file_size)
 
                     if is_text:
                         links.append(f"{base}/{model}/resolve/{branch}/{fname}")
@@ -149,6 +159,7 @@ class ModelDownloader:
             for i in range(len(classifications) - 1, -1, -1):
                 if classifications[i] in ['pytorch', 'pt', 'gguf']:
                     links.pop(i)
+                    file_sizes.pop(i)
 
         # For GGUF, try to download only the Q4_K_M if no specific file is specified.
         if has_gguf and specific_file is None:
@@ -161,19 +172,21 @@ class ModelDownloader:
                 for i in range(len(classifications) - 1, -1, -1):
                     if 'q4_k_m' not in links[i].lower():
                         links.pop(i)
+                        file_sizes.pop(i)
             else:
                 for i in range(len(classifications) - 1, -1, -1):
                     if links[i].lower().endswith('.gguf'):
                         links.pop(i)
+                        file_sizes.pop(i)
 
         is_llamacpp = has_gguf and specific_file is not None
-        return links, sha256, is_lora, is_llamacpp
+        return links, sha256, is_lora, is_llamacpp, file_sizes
 
     def get_output_folder(self, model, branch, is_lora, is_llamacpp=False, model_dir=None):
         if model_dir:
             base_folder = model_dir
         else:
-            base_folder = 'models' if not is_lora else 'loras'
+            base_folder = 'user_data/models' if not is_lora else 'user_data/loras'
 
         # If the model is of type GGUF, save directly in the base_folder
         if is_llamacpp:
@@ -186,78 +199,132 @@ class ModelDownloader:
         output_folder = Path(base_folder) / output_folder
         return output_folder
 
+    @property
+    def progress_bar_slots(self):
+        if self._progress_bar_slots is None:
+            raise RuntimeError("Progress bar slots not initialized. Start download threads first.")
+
+        return self._progress_bar_slots
+
+    def initialize_progress_bar_slots(self, num_threads):
+        self._progress_bar_slots = Array("B", [0] * num_threads)
+
+    def get_progress_bar_position(self):
+        with self.progress_bar_slots.get_lock():
+            for i in range(len(self.progress_bar_slots)):
+                if self.progress_bar_slots[i] == 0:
+                    self.progress_bar_slots[i] = 1
+                    return i
+
+        return 0  # fallback
+
+    def release_progress_bar_position(self, slot):
+        with self.progress_bar_slots.get_lock():
+            self.progress_bar_slots[slot] = 0
+
     def get_single_file(self, url, output_folder, start_from_scratch=False):
         filename = Path(url.rsplit('/', 1)[1])
         output_path = output_folder / filename
+        progress_bar_position = self.get_progress_bar_position()
 
-        max_retries = 7
+        max_retries = self.max_retries
         attempt = 0
-        while attempt < max_retries:
-            attempt += 1
-            session = self.session
-            headers = {}
-            mode = 'wb'
+        file_downloaded_count_for_progress = 0
 
-            try:
-                if output_path.exists() and not start_from_scratch:
-                    # Resume download
-                    r = session.get(url, stream=True, timeout=20)
-                    total_size = int(r.headers.get('content-length', 0))
-                    if output_path.stat().st_size >= total_size:
-                        return
+        try:
+            while attempt < max_retries:
+                attempt += 1
+                session = self.session
+                headers = {}
+                mode = 'wb'
+                current_file_size_on_disk = 0
 
-                    headers = {'Range': f'bytes={output_path.stat().st_size}-'}
-                    mode = 'ab'
+                try:
+                    if output_path.exists() and not start_from_scratch:
+                        current_file_size_on_disk = output_path.stat().st_size
+                        r_head = session.head(url, timeout=20)
+                        r_head.raise_for_status()
+                        total_size = int(r_head.headers.get('content-length', 0))
 
-                with session.get(url, stream=True, headers=headers, timeout=30) as r:
-                    r.raise_for_status()  # If status is not 2xx, raise an error
-                    total_size = int(r.headers.get('content-length', 0))
-                    block_size = 1024 * 1024  # 1MB
+                        if current_file_size_on_disk >= total_size and total_size > 0:
+                            if self.progress_queue is not None and total_size > 0:
+                                self.progress_queue.put((1.0, str(filename)))
+                            return
 
-                    filename_str = str(filename)  # Convert PosixPath to string if necessary
+                        headers = {'Range': f'bytes={current_file_size_on_disk}-'}
+                        mode = 'ab'
 
-                    tqdm_kwargs = {
-                        'total': total_size,
-                        'unit': 'B',
-                        'unit_scale': True,
-                        'unit_divisor': 1024,
-                        'bar_format': '{desc}{percentage:3.0f}%|{bar:50}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
-                        'desc': f"{filename_str}: "
-                    }
+                    with session.get(url, stream=True, headers=headers, timeout=30) as r:
+                        r.raise_for_status()
+                        total_size_from_stream = int(r.headers.get('content-length', 0))
+                        if mode == 'ab':
+                            effective_total_size = current_file_size_on_disk + total_size_from_stream
+                        else:
+                            effective_total_size = total_size_from_stream
 
-                    if 'COLAB_GPU' in os.environ:
-                        tqdm_kwargs.update({
-                            'position': 0,
-                            'leave': True
-                        })
+                        block_size = 1024 * 1024
+                        filename_str = str(filename)
 
-                    with open(output_path, mode) as f:
-                        with tqdm.tqdm(**tqdm_kwargs) as t:
-                            count = 0
-                            for data in r.iter_content(block_size):
-                                f.write(data)
-                                t.update(len(data))
-                                if total_size != 0 and self.progress_bar is not None:
-                                    count += len(data)
-                                    self.progress_bar(float(count) / float(total_size), f"{filename_str}")
+                        tqdm_kwargs = {
+                            'total': effective_total_size,
+                            'initial': current_file_size_on_disk if mode == 'ab' else 0,
+                            'unit': 'B',
+                            'unit_scale': True,
+                            'unit_divisor': 1024,
+                            'bar_format': '{desc}{percentage:3.0f}%|{bar:50}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+                            'desc': f"{filename_str}: ",
+                            'position': progress_bar_position,
+                            'leave': False
+                        }
 
-                    break  # Exit loop if successful
-            except (RequestException, ConnectionError, Timeout) as e:
-                print(f"Error downloading {filename}: {e}.")
-                print(f"That was attempt {attempt}/{max_retries}.", end=' ')
-                if attempt < max_retries:
-                    print(f"Retry begins in {2 ** attempt} seconds.")
-                    sleep(2 ** attempt)
-                else:
-                    print("Failed to download after the maximum number of attempts.")
+                        if 'COLAB_GPU' in os.environ:
+                            tqdm_kwargs.update({
+                                'position': 0,
+                                'leave': True
+                            })
+
+                        with open(output_path, mode) as f:
+                            if mode == 'ab':
+                                f.seek(current_file_size_on_disk)
+
+                            with tqdm.tqdm(**tqdm_kwargs) as t:
+                                file_downloaded_count_for_progress = current_file_size_on_disk
+                                for data in r.iter_content(block_size):
+                                    f.write(data)
+                                    t.update(len(data))
+                                    if effective_total_size != 0 and self.progress_queue is not None:
+                                        file_downloaded_count_for_progress += len(data)
+                                        progress_fraction = float(file_downloaded_count_for_progress) / float(effective_total_size)
+                                        self.progress_queue.put((progress_fraction, filename_str))
+                        break
+
+                except (RequestException, ConnectionError, Timeout) as e:
+                    print(f"Error downloading {filename}: {e}.")
+                    print(f"That was attempt {attempt}/{max_retries}.", end=' ')
+                    if attempt < max_retries:
+                        print(f"Retry begins in {2 ** attempt} seconds.")
+                        sleep(2 ** attempt)
+                    else:
+                        print("Failed to download after the maximum number of attempts.")
+        finally:
+            self.release_progress_bar_position(progress_bar_position)
 
     def start_download_threads(self, file_list, output_folder, start_from_scratch=False, threads=4):
-        thread_map(lambda url: self.get_single_file(url, output_folder, start_from_scratch=start_from_scratch), file_list, max_workers=threads, disable=True)
+        self.initialize_progress_bar_slots(threads)
+        tqdm.tqdm.set_lock(tqdm.tqdm.get_lock())
+        try:
+            thread_map(
+                lambda url: self.get_single_file(url, output_folder, start_from_scratch=start_from_scratch),
+                file_list,
+                max_workers=threads,
+                disable=True
+            )
+        finally:
+            print(f"\nDownload of {len(file_list)} files to {output_folder} completed.")
 
-    def download_model_files(self, model, branch, links, sha256, output_folder, progress_bar=None, start_from_scratch=False, threads=4, specific_file=None, is_llamacpp=False):
-        self.progress_bar = progress_bar
+    def download_model_files(self, model, branch, links, sha256, output_folder, progress_queue=None, start_from_scratch=False, threads=4, specific_file=None, is_llamacpp=False):
+        self.progress_queue = progress_queue
 
-        # Create the folder and writing the metadata
         output_folder.mkdir(parents=True, exist_ok=True)
 
         if not is_llamacpp:
@@ -315,10 +382,10 @@ if __name__ == '__main__':
     parser.add_argument('--specific-file', type=str, default=None, help='Name of the specific file to download (if not provided, downloads all).')
     parser.add_argument('--exclude-pattern', type=str, default=None, help='Regex pattern to exclude files from download.')
     parser.add_argument('--output', type=str, default=None, help='Save the model files to this folder.')
-    parser.add_argument('--model-dir', type=str, default=None, help='Save the model files to a subfolder of this folder instead of the default one (text-generation-webui/models).')
+    parser.add_argument('--model-dir', type=str, default=None, help='Save the model files to a subfolder of this folder instead of the default one (text-generation-webui/user_data/models).')
     parser.add_argument('--clean', action='store_true', help='Does not resume the previous download.')
     parser.add_argument('--check', action='store_true', help='Validates the checksums of model files.')
-    parser.add_argument('--max-retries', type=int, default=5, help='Max retries count when get error in download time.')
+    parser.add_argument('--max-retries', type=int, default=7, help='Max retries count when get error in download time.')
     args = parser.parse_args()
 
     branch = args.branch
@@ -339,7 +406,7 @@ if __name__ == '__main__':
         sys.exit()
 
     # Get the download links from Hugging Face
-    links, sha256, is_lora, is_llamacpp = downloader.get_download_links_from_huggingface(
+    links, sha256, is_lora, is_llamacpp, file_sizes = downloader.get_download_links_from_huggingface(
         model, branch, text_only=args.text_only, specific_file=specific_file, exclude_pattern=exclude_pattern
     )
 

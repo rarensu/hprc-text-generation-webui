@@ -5,7 +5,6 @@ import gradio as gr
 from modules.html_generator import get_image_cache
 from modules.shared import gradio
 
-
 params = {
     'items_per_page': 50,
     'open': False,
@@ -73,13 +72,13 @@ def generate_html():
     global cards
     cards = []
     # Iterate through files in image folder
-    for file in sorted(Path("characters").glob("*")):
+    for file in sorted(Path("user_data/characters").glob("*")):
         if file.suffix in [".json", ".yml", ".yaml"]:
             character = file.stem
             container_html = '<div class="character-container">'
             image_html = "<div class='placeholder'></div>"
 
-            for path in [Path(f"characters/{character}.{extension}") for extension in ['png', 'jpg', 'jpeg']]:
+            for path in [Path(f"user_data/characters/{character}.{extension}") for extension in ['png', 'jpg', 'jpeg']]:
                 if path.exists():
                     image_html = f'<img src="file/{get_image_cache(path)}">'
                     break
@@ -93,10 +92,11 @@ def generate_html():
 
 def filter_cards(filter_str=''):
     if filter_str == '':
-        return cards
+        return gr.Dataset(samples=cards)
 
     filter_upper = filter_str.upper()
-    return [k for k in cards if filter_upper in k[1].upper()]
+    filtered = [k for k in cards if filter_upper in k[1].upper()]
+    return gr.Dataset(samples=filtered)
 
 
 def select_character(evt: gr.SelectData):
